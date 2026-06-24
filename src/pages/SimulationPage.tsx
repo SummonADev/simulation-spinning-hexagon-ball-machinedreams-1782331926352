@@ -18,10 +18,14 @@ export default function SimulationPage() {
       <aside className="w-full md:w-80 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-800 p-6 flex flex-col gap-6 z-10">
         <div className="flex items-center gap-2">
           <Settings2 className="w-6 h-6 text-cyan-400" />
-          <h1 className="text-xl font-bold tracking-tight text-slate-100">HexaSim v1.0</h1>
+          <h1 className="text-xl font-bold tracking-tight text-slate-100">HexaSim</h1>
         </div>
 
-        <Controls 
+        <div className="text-xs text-slate-500 -mt-4 font-mono">
+          Pure Canvas · Custom Physics
+        </div>
+
+        <Controls
           rotationSpeed={rotationSpeed}
           setRotationSpeed={setRotationSpeed}
           gravity={gravity}
@@ -32,23 +36,31 @@ export default function SimulationPage() {
           setBallSize={setBallSize}
         />
 
-        <button 
-          onClick={handleReset}
-          className="mt-auto flex items-center justify-center gap-2 bg-cyan-600 hover:bg-cyan-500 transition-colors text-white font-semibold py-3 px-4 rounded-lg shadow-lg active:scale-95"
-        >
-          <RefreshCw className="w-4 h-4" />
-          Reset Simulation
-        </button>
+        <div className="mt-auto flex flex-col gap-3">
+          <div className="rounded-lg bg-slate-800 p-3 text-xs font-mono text-slate-400 grid grid-cols-2 gap-y-1">
+            <span className="text-slate-500">GRAVITY</span>
+            <span className="text-cyan-400 text-right">{gravity.toFixed(2)} g</span>
+            <span className="text-slate-500">RPM</span>
+            <span className="text-cyan-400 text-right">{((rotationSpeed * 60 * 60) / (2 * Math.PI)).toFixed(1)}</span>
+            <span className="text-slate-500">RESTITUTION</span>
+            <span className="text-cyan-400 text-right">{restitution.toFixed(2)}</span>
+            <span className="text-slate-500">BALL SIZE</span>
+            <span className="text-cyan-400 text-right">{ballSize} px</span>
+          </div>
+
+          <button
+            onClick={handleReset}
+            className="flex items-center justify-center gap-2 bg-cyan-600 hover:bg-cyan-500 transition-colors text-white font-semibold py-3 px-4 rounded-lg shadow-lg active:scale-95"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Reset Simulation
+          </button>
+        </div>
       </aside>
 
       {/* Main Simulation Area */}
-      <main className="flex-1 relative bg-slate-950 flex items-center justify-center p-4">
-        <div className="absolute top-4 left-4 text-slate-500 text-sm font-mono pointer-events-none">
-          ENGINE: Matter.js 2D<br />
-          GRAVITY: {gravity.toFixed(2)}<br />
-          RPM: {((rotationSpeed * 60) / (2 * Math.PI)).toFixed(1)}
-        </div>
-        <HexagonSimulation 
+      <main className="flex-1 relative bg-slate-950 flex items-center justify-center">
+        <HexagonSimulation
           key={resetKey}
           rotationSpeed={rotationSpeed}
           gravity={gravity}
