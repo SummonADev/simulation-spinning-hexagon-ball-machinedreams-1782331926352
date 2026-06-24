@@ -11,8 +11,8 @@ type HexagonSimulationProps = {
 
 const TWO_PI = Math.PI * 2;
 const SIDES = 6;
-const SUBSTEPS = 8;
-const FIXED_DT = 1 / 60;
+const SUBSTEPS = 12;
+const FRICTION = 0.12;
 
 function dot(a: Vec2, b: Vec2): number {
   return a.x * b.x + a.y * b.y;
@@ -44,30 +44,29 @@ function perp(v: Vec2): Vec2 {
   return { x: -v.y, y: v.x };
 }
 
-// Reflect velocity off a normal, with restitution and friction
 function resolveWallCollision(
   vel: Vec2,
-  normal: Vec2,
+  inwardNormal: Vec2,
   wallVel: Vec2,
   restitution: number,
   friction: number
 ): Vec2 {
   const relVel = sub(vel, wallVel);
-  const vn = dot(relVel, normal);
-  if (vn >= 0) return vel; // separating, skip
+  const vn = dot(relVel, inwardNormal);
+  if (vn >= 0) return vel;
 
   // Normal impulse
-  const normalImpulse = -(1 + restitution) * vn;
-  const afterNormal = add(relVel, scale(normal, normalImpulse));
+  const jn = -(1 + restitution) * vn;
+  const afterNormal: Vec2 = { x: relVel.x + inwardNormal.x * jn, y: relVel.y + inwardNormal.y * jn };
 
-  // Tangent friction
-  const tangent = perp(normal);
+  // Tangential friction impulse
+  const tangent = perp(inwardNormal);
   const vt = dot(afterNormal, tangent);
-  const frictionImpulse = -friction * Math.abs(normalImpulse);
-  const clampedFriction = Math.max(-Math.abs(vt), Math.min(Math.abs(vt), frictionImpulse));
-  const afterTangent = add(afterNormal, scale(tangent, Math.sign(vt) * clampedFriction));
+  const maxFriction = friction * Math.abs(jn);
+  const jt = Math.max(-maxFriction, Math.min(maxFriction, -vt));
+  const afterFriction: Vec2 = { x: afterNormal.x + tangent.x * jt, y: afterNormal.y + tangent.y * jt };
 
-  return add(wallVel, afterTangent);
+  return add(wallVel, afterFriction);
 }
 
 export default function HexagonSimulation({
@@ -80,7 +79,6 @@ export default function HexagonSimulation({
   const containerRef = useRef<HTMLDivElement>(null);
   const animRef = useRef<number>(0);
 
-  // Mutable refs for live-updated params (no restart needed)
   const rotSpeedRef = useRef(rotationSpeed);
   const gravityRef = useRef(gravity);
   const restitutionRef = useRef(restitution);
@@ -97,23 +95,31 @@ export default function HexagonSimulation({
     if (!canvas || !container) return;
 
     const ctx = canvas.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
 
-    // ---- sizing ----
     let W = container.clientWidth;
     let H = container.clientHeight;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    ctx.scale(dpr, dpr);
 
-    // ---- state ----
+    function resizeCanvas() {
+      W = container!.clientWidth;
+      H = container!.clientHeight;
+      canvas!.width = W * dpr;
+      canvas!.height = H * dpr;
+      canvas!.style.width = W + 'px';
+      canvas!.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    resizeCanvas();
+
+    // Trail history
+    const MAX_TRAIL = 40;
+    const trail: Vec2[] = [];
+
+    // State
     let hexAngle = 0;
-    let ballPos: Vec2 = { x: W / 2, y: H / 2 - 40 };
-    let ballVel: Vec2 = { x: 1.5, y: 0 };
+    let ballPos: Vec2 = { x: W / 2, y: H / 2 - 50 };
+    let ballVel: Vec2 = { x: 2, y: 0 };
 
-    // Build hex vertices at angle
     function hexVertices(cx: number, cy: number, r: number, angle: number): Vec2[] {
       const verts: Vec2[] = [];
       for (let i = 0; i < SIDES; i++) {
@@ -125,145 +131,137 @@ export default function HexagonSimulation({
 
     let lastTime: number | null = null;
     let accumulator = 0;
+    const FIXED_DT = 1 / 60;
+    const subDt = FIXED_DT / SUBSTEPS;
 
-    function loop(ts: number) {
-      animRef.current = requestAnimationFrame(loop);
-
-      if (lastTime === null) { lastTime = ts; }
-      let dt = (ts - lastTime) / 1000;
-      lastTime = ts;
-      // clamp to avoid spiral of death
-      if (dt > 0.05) dt = 0.05;
-      accumulator += dt;
-
+    function physicsStep() {
       const cx = W / 2;
       const cy = H / 2;
       const hexRadius = Math.min(cx, cy) * 0.72;
-      const ballRadius = ballSizeRef.current;
+      const ballR = ballSizeRef.current;
+      const g = gravityRef.current;
+      const rot = rotSpeedRef.current;
+      const rest = restitutionRef.current;
 
-      // Fixed-timestep physics
-      const subDt = FIXED_DT / SUBSTEPS;
-      while (accumulator >= FIXED_DT) {
-        for (let s = 0; s < SUBSTEPS; s++) {
-          // Rotate hex
-          hexAngle += rotSpeedRef.current * subDt * 60;
+      // Rotate hexagon
+      hexAngle += rot * subDt * TWO_PI;
 
-          // Gravity
-          ballVel = add(ballVel, { x: 0, y: gravityRef.current * 0.5 * subDt * 60 });
+      // Apply gravity (pixels/s²  scaled for feel)
+      ballVel = add(ballVel, { x: 0, y: g * 9.8 * subDt });
 
-          // Move ball
-          ballPos = add(ballPos, scale(ballVel, subDt * 60));
+      // Move ball
+      ballPos = add(ballPos, scale(ballVel, subDt));
 
-          // Collision detection with each hex wall
-          const verts = hexVertices(cx, cy, hexRadius, hexAngle);
-          const prevHexAngle = hexAngle - rotSpeedRef.current * subDt * 60;
+      const verts = hexVertices(cx, cy, hexRadius, hexAngle);
 
-          for (let i = 0; i < SIDES; i++) {
-            const v0 = verts[i];
-            const v1 = verts[(i + 1) % SIDES];
+      for (let i = 0; i < SIDES; i++) {
+        const v0 = verts[i];
+        const v1 = verts[(i + 1) % SIDES];
 
-            const edge = sub(v1, v0);
-            const edgeLen = length(edge);
-            const edgeDir = normalize(edge);
-            const wallNormal = normalize(perp(edge)); // inward if CCW winding
+        const edge = sub(v1, v0);
+        const edgeLen = length(edge);
+        if (edgeLen < 1e-8) continue;
+        const edgeDir = normalize(edge);
+        const wallNormal = perp(edgeDir); // CCW perp
 
-            // Project ball center onto the edge line
-            const toBall = sub(ballPos, v0);
-            const proj = dot(toBall, edgeDir);
-            const clampedProj = Math.max(0, Math.min(edgeLen, proj));
-            const closest: Vec2 = add(v0, scale(edgeDir, clampedProj));
+        // Inward normal: must point toward the center
+        const midPoint: Vec2 = { x: (v0.x + v1.x) / 2, y: (v0.y + v1.y) / 2 };
+        const toCenter = sub({ x: cx, y: cy }, midPoint);
+        const inward = dot(toCenter, wallNormal) >= 0 ? wallNormal : scale(wallNormal, -1);
 
-            const diff = sub(ballPos, closest);
-            const dist = length(diff);
+        // Closest point on segment to ball
+        const toBall = sub(ballPos, v0);
+        const proj = Math.max(0, Math.min(edgeLen, dot(toBall, edgeDir)));
+        const closest: Vec2 = add(v0, scale(edgeDir, proj));
 
-            // Determine which side: inward normal should point toward center
-            const toCenter = sub({ x: cx, y: cy }, closest);
-            const inward = dot(toCenter, wallNormal) > 0 ? wallNormal : scale(wallNormal, -1);
+        const diff = sub(ballPos, closest);
+        const dist = length(diff);
 
-            if (dist < ballRadius) {
-              // Push ball inside
-              const penetration = ballRadius - dist;
-              const pushDir = dist < 1e-6 ? inward : normalize(diff);
-              // Make sure pushDir points inward
-              const pushInward = dot(pushDir, inward) > 0 ? pushDir : scale(pushDir, -1);
-              ballPos = add(ballPos, scale(pushInward, penetration + 0.1));
+        // Only collide if ball is on the outer side (outside the wall from center's perspective)
+        // i.e., the ball has penetrated through the inward normal side
+        const signedDist = dot(sub(ballPos, closest), inward);
 
-              // Wall velocity at contact point (rotating wall)
-              const r_vec = sub(closest, { x: cx, y: cy });
-              const wallAngVel = rotSpeedRef.current * 60 / (TWO_PI) * TWO_PI; // rad per frame * 60fps
-              const wallVel: Vec2 = {
-                x: -r_vec.y * rotSpeedRef.current * 60,
-                y: r_vec.x * rotSpeedRef.current * 60
-              };
+        if (signedDist < ballR) {
+          const penetration = ballR - signedDist;
+          // Push ball inward
+          ballPos = add(ballPos, scale(inward, penetration + 0.01));
 
-              ballVel = resolveWallCollision(
-                ballVel,
-                pushInward,
-                wallVel,
-                restitutionRef.current,
-                0.15
-              );
-            }
-          }
+          // Wall surface velocity at closest point (tangential due to rotation)
+          const r_vec = sub(closest, { x: cx, y: cy });
+          const angVelRad = rot * TWO_PI; // radians per second
+          const wallVel: Vec2 = {
+            x: -r_vec.y * angVelRad,
+            y: r_vec.x * angVelRad
+          };
 
-          // Safety: if ball escapes the hex entirely, reset
-          const distFromCenter = length(sub(ballPos, { x: cx, y: cy }));
-          if (distFromCenter > hexRadius + ballSizeRef.current * 4) {
-            ballPos = { x: cx, y: cy - 20 };
-            ballVel = { x: 0, y: 0 };
-          }
+          ballVel = resolveWallCollision(ballVel, inward, wallVel, rest, FRICTION);
         }
-        accumulator -= FIXED_DT;
       }
 
-      // ---- DRAW ----
+      // Safety reset
+      const distFromCenter = length(sub(ballPos, { x: cx, y: cy }));
+      if (distFromCenter > hexRadius * 1.5) {
+        ballPos = { x: cx, y: cy - 30 };
+        ballVel = { x: 1, y: 0 };
+      }
+    }
+
+    function drawScene() {
+      const cx = W / 2;
+      const cy = H / 2;
+      const hexRadius = Math.min(cx, cy) * 0.72;
+      const ballR = ballSizeRef.current;
+
       ctx.clearRect(0, 0, W, H);
 
-      // Background glow
-      const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(cx, cy));
-      bg.addColorStop(0, '#0f172a');
+      // Background
+      const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(W, H) * 0.75);
+      bg.addColorStop(0, '#0f1e3a');
       bg.addColorStop(1, '#020617');
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
       const verts = hexVertices(cx, cy, hexRadius, hexAngle);
 
-      // Hex glow shadow
+      // Hex glow outer
       ctx.save();
-      ctx.shadowColor = '#22d3ee';
-      ctx.shadowBlur = 28;
       ctx.beginPath();
       ctx.moveTo(verts[0].x, verts[0].y);
       for (let i = 1; i < SIDES; i++) ctx.lineTo(verts[i].x, verts[i].y);
       ctx.closePath();
-      ctx.strokeStyle = 'rgba(34,211,238,0.18)';
-      ctx.lineWidth = 24;
+      ctx.shadowColor = '#22d3ee';
+      ctx.shadowBlur = 36;
+      ctx.strokeStyle = 'rgba(34,211,238,0.12)';
+      ctx.lineWidth = 28;
       ctx.stroke();
       ctx.restore();
 
-      // Hex fill (semi-transparent)
+      // Hex fill
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(verts[0].x, verts[0].y);
       for (let i = 1; i < SIDES; i++) ctx.lineTo(verts[i].x, verts[i].y);
       ctx.closePath();
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.55)';
+      ctx.fillStyle = 'rgba(8, 18, 40, 0.60)';
       ctx.fill();
       ctx.restore();
 
-      // Hex border
+      // Hex border gradient
       ctx.save();
       ctx.beginPath();
       ctx.moveTo(verts[0].x, verts[0].y);
       for (let i = 1; i < SIDES; i++) ctx.lineTo(verts[i].x, verts[i].y);
       ctx.closePath();
-      const grad = ctx.createLinearGradient(cx - hexRadius, cy - hexRadius, cx + hexRadius, cy + hexRadius);
+      const grad = ctx.createLinearGradient(cx - hexRadius, cy, cx + hexRadius, cy);
       grad.addColorStop(0, '#22d3ee');
-      grad.addColorStop(0.5, '#818cf8');
+      grad.addColorStop(0.33, '#818cf8');
+      grad.addColorStop(0.66, '#38bdf8');
       grad.addColorStop(1, '#06b6d4');
       ctx.strokeStyle = grad;
       ctx.lineWidth = 4;
       ctx.lineJoin = 'round';
+      ctx.shadowColor = '#818cf8';
+      ctx.shadowBlur = 12;
       ctx.stroke();
       ctx.restore();
 
@@ -271,65 +269,111 @@ export default function HexagonSimulation({
       for (const v of verts) {
         ctx.save();
         ctx.beginPath();
-        ctx.arc(v.x, v.y, 5, 0, TWO_PI);
+        ctx.arc(v.x, v.y, 5.5, 0, TWO_PI);
         ctx.fillStyle = '#67e8f9';
         ctx.shadowColor = '#22d3ee';
-        ctx.shadowBlur = 10;
+        ctx.shadowBlur = 14;
         ctx.fill();
         ctx.restore();
       }
 
-      // Ball shadow
+      // Ball trail
+      if (trail.length > 1) {
+        for (let i = 1; i < trail.length; i++) {
+          const alpha = (i / trail.length) * 0.55;
+          const r = ballR * (i / trail.length) * 0.75;
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(trail[i].x, trail[i].y, Math.max(r, 1), 0, TWO_PI);
+          ctx.fillStyle = `rgba(236,72,153,${alpha})`;
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      // Ball glow
       ctx.save();
+      ctx.shadowColor = '#f472b6';
+      ctx.shadowBlur = 30;
       const ballGrad = ctx.createRadialGradient(
-        ballPos.x - ballSizeRef.current * 0.3,
-        ballPos.y - ballSizeRef.current * 0.3,
-        ballSizeRef.current * 0.1,
+        ballPos.x - ballR * 0.3,
+        ballPos.y - ballR * 0.3,
+        ballR * 0.08,
         ballPos.x,
         ballPos.y,
-        ballSizeRef.current
+        ballR
       );
-      ballGrad.addColorStop(0, '#f9a8d4');
-      ballGrad.addColorStop(0.6, '#ec4899');
+      ballGrad.addColorStop(0, '#fce7f3');
+      ballGrad.addColorStop(0.4, '#f472b6');
       ballGrad.addColorStop(1, '#9d174d');
-      ctx.shadowColor = '#f472b6';
-      ctx.shadowBlur = 22;
       ctx.beginPath();
-      ctx.arc(ballPos.x, ballPos.y, ballSizeRef.current, 0, TWO_PI);
+      ctx.arc(ballPos.x, ballPos.y, ballR, 0, TWO_PI);
       ctx.fillStyle = ballGrad;
       ctx.fill();
       ctx.restore();
 
-      // Ball shine
+      // Ball specular highlight
       ctx.save();
       ctx.beginPath();
       ctx.arc(
-        ballPos.x - ballSizeRef.current * 0.28,
-        ballPos.y - ballSizeRef.current * 0.28,
-        ballSizeRef.current * 0.32,
-        0,
-        TWO_PI
+        ballPos.x - ballR * 0.3,
+        ballPos.y - ballR * 0.3,
+        ballR * 0.3,
+        0, TWO_PI
       );
-      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fillStyle = 'rgba(255,255,255,0.28)';
       ctx.fill();
       ctx.restore();
+
+      // Speed indicator (velocity vector)
+      const speed = length(ballVel);
+      if (speed > 0.5) {
+        const dir = normalize(ballVel);
+        const arrowLen = Math.min(speed * 3, 60);
+        ctx.save();
+        ctx.strokeStyle = 'rgba(250,204,21,0.7)';
+        ctx.lineWidth = 2;
+        ctx.shadowColor = '#fde047';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.moveTo(ballPos.x, ballPos.y);
+        ctx.lineTo(ballPos.x + dir.x * arrowLen, ballPos.y + dir.y * arrowLen);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    function loop(ts: number) {
+      animRef.current = requestAnimationFrame(loop);
+
+      if (lastTime === null) { lastTime = ts; }
+      let dt = (ts - lastTime) / 1000;
+      lastTime = ts;
+      if (dt > 0.05) dt = 0.05;
+      accumulator += dt;
+
+      while (accumulator >= FIXED_DT) {
+        for (let s = 0; s < SUBSTEPS; s++) {
+          physicsStep();
+        }
+        // Record trail at lower frequency
+        trail.push({ x: ballPos.x, y: ballPos.y });
+        if (trail.length > MAX_TRAIL) trail.shift();
+        accumulator -= FIXED_DT;
+      }
+
+      drawScene();
     }
 
     animRef.current = requestAnimationFrame(loop);
 
-    // Resize
     const handleResize = () => {
-      if (!container) return;
-      W = container.clientWidth;
-      H = container.clientHeight;
-      canvas.width = W * dpr;
-      canvas.height = H * dpr;
-      canvas.style.width = W + 'px';
-      canvas.style.height = H + 'px';
-      ctx.scale(dpr, dpr);
-      // Re-center ball
-      ballPos = { x: W / 2, y: H / 2 - 40 };
-      ballVel = { x: 1.5, y: 0 };
+      resizeCanvas();
+      const cx = W / 2;
+      const cy = H / 2;
+      ballPos = { x: cx, y: cy - 50 };
+      ballVel = { x: 2, y: 0 };
+      trail.length = 0;
     };
     window.addEventListener('resize', handleResize);
 
@@ -337,10 +381,10 @@ export default function HexagonSimulation({
       cancelAnimationFrame(animRef.current);
       window.removeEventListener('resize', handleResize);
     };
-  }, [ballSize, restitution]); // re-init when structural props change
+  }, []);
 
   return (
-    <div ref={containerRef} className="w-full h-full flex items-center justify-center">
+    <div ref={containerRef} className="w-full h-full">
       <canvas ref={canvasRef} className="block" />
     </div>
   );
